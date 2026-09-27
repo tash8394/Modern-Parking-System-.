@@ -1,0 +1,1130 @@
+
+import com.sun.net.httpserver.Headers;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+import java.io.*;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.Executors;
+
+/**
+ * ParkSmart Kenya
+ * Automated Web-Based Parking Management System
+ *
+ * MMU Actual System Development - Java
+ *
+ * Features:
+ * 1. Displays available and occupied parking slots.
+ * 2. Records vehicle arrival.
+ * 3. Records entry time automatically.
+ * 4. Calculates parking duration on exit.
+ * 5. Calculates parking fee according to the assignment.
+ * 6. Simulates payment and barrier opening.
+ * 7. Stores records locally in parking_data.dat.
+ * 8. Provides simple JSON APIs for slots and fee calculation.
+ *
+ * Requires Java 11 or later.
+ *
+ * Compile:
+ *     javac ParkSmartKenya.java
+ *
+ * Run:
+ *     java ParkSmartKenya
+ *
+ * Open:
+ *     http://localhost:8080
+ */
+public class ParkSmartKenya {
+
+    private static final int PORT = 8080;
+    private static final String DATA_FILE = "parking_data.dat";
+    private static final DateTimeFormatter DATE_TIME =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    private static final List<ParkingSlot> slots = new ArrayList<>();
+    private static final List<ParkingRecord> records = new ArrayList<>();
+
+    private static int nextRecordId = 1;
+
+    public static void main(String[] args) throws Exception {
+        loadData();
+        initializeSlots();
+
+        HttpServer server = HttpServer.create(
+                new InetSocketAddress(PORT), 0
+        );
+
+        server.createContext("/", ParkSmartKenya::handleHome);
+        server.createContext("/entry", ParkSmartKenya::handleEntry);
+        server.createContext("/exit", ParkSmartKenya::handleExit);
+        server.createContext("/api/slots", ParkSmartKenya::handleSlotsApi);
+        server.createContext("/api/fee", ParkSmartKenya::handleFeeApi);
+
+        server.setExecutor(Executors.newCachedThreadPool());
+        server.start();
+
+        System.out.println("==============================================");
+        System.out.println("      ParkSmart Kenya is running");
+        System.out.println("==============================================");
+        System.out.println("Open: http://localhost:" + PORT);
+        System.out.println("Press Ctrl+C to stop.");
+    }
+
+    // ------------------------------------------------------------
+    // DATABASE / LOCAL STORAGE
+    // ------------------------------------------------------------
+
+    private static synchronized void initializeSlots() {
+        if (!slots.isEmpty()) {
+            return;
+        }
+
+        for (int i = 1; i <= 30; i++) {
+            slots.add(new ParkingSlot("P-" + String.format("%02d", i)));
+        }
+    }
+
+    private static synchronized void loadData() {
+        File file = new File(DATA_FILE);
+
+        if (!file.exists()) {
+            return;
+        }
+
+        try (ObjectInputStream input =
+                     new ObjectInputStream(new FileInputStream(file))) {
+
+            Object object = input.readObject();
+
+            if (object instanceof ParkingDatabase) {
+                ParkingDatabase db = (ParkingDatabase) object;
+
+                slots.clear();
+                slots.addAll(db.slots);
+
+                records.clear();
+                records.addAll(db.records);
+
+                nextRecordId = db.nextRecordId;
+            }
+
+        } catch (Exception e) {
+            System.err.println("Could not load saved data. Starting fresh.");
+            System.err.println(e.getMessage());
+        }
+    }
+
+    private static synchronized void saveData() {
+        ParkingDatabase db =
+                new ParkingDatabase(slots, records, nextRecordId);
+
+        try (ObjectOutputStream output =
+                     new ObjectOutputStream(new FileOutputStream(DATA_FILE))) {
+
+            output.writeObject(db);
+
+        } catch (IOException e) {
+            System.err.println("Could not save parking data: " + e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------
+    // HOME PAGE
+    // ------------------------------------------------------------
+
+    private static void handleHome(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equalsIgnoreCase("GET")) {
+            sendResponse(exchange, 405, "Method Not Allowed", "text/plain");
+            return;
+        }
+
+        String html = buildHomePage();
+        sendResponse(exchange, 200, html, "text/html");
+    }
+
+    private static String buildHomePage() {
+        int total = slots.size();
+        int occupied = 0;
+
+        for (ParkingSlot slot : slots) {
+            if (slot.occupied) {
+                occupied++;
+            }
+        }
+
+        int available = total - occupied;
+
+        StringBuilder html = new StringBuilder();
+
+        html.append("""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport"
+                          content="width=device-width, initial-scale=1.0">
+
+                    <title>ParkSmart Kenya</title>
+
+                    <style>
+                        * {
+                            box-sizing: border-box;
+                        }
+
+                        body {
+                            margin: 0;
+                            font-family: Arial, sans-serif;
+                            background: #f4f6f9;
+                            color: #222;
+                        }
+
+                        header {
+                            background: #17202a;
+                            color: white;
+                            padding: 20px;
+                            text-align: center;
+                        }
+
+                        header h1 {
+                            margin: 0 0 5px 0;
+                        }
+
+                        header p {
+                            margin: 0;
+                            opacity: 0.8;
+                        }
+
+                        .container {
+                            width: 94%;
+                            max-width: 1250px;
+                            margin: 25px auto;
+                        }
+
+                        .stats {
+                            display: grid;
+                            grid-template-columns:
+                                repeat(auto-fit, minmax(200px, 1fr));
+                            gap: 15px;
+                            margin-bottom: 25px;
+                        }
+
+                        .stat {
+                            background: white;
+                            padding: 20px;
+                            border-radius: 12px;
+                            box-shadow: 0 2px 10px #00000012;
+                            text-align: center;
+                        }
+
+                        .stat h2 {
+                            margin: 0;
+                            font-size: 34px;
+                        }
+
+                        .green {
+                            color: #198754;
+                        }
+
+                        .red {
+                            color: #dc3545;
+                        }
+
+                        .blue {
+                            color: #0d6efd;
+                        }
+
+                        .card {
+                            background: white;
+                            border-radius: 12px;
+                            padding: 20px;
+                            margin-bottom: 25px;
+                            box-shadow: 0 2px 10px #00000012;
+                        }
+
+                        .grid {
+                            display: grid;
+                            grid-template-columns:
+                                repeat(auto-fill, minmax(100px, 1fr));
+                            gap: 12px;
+                        }
+
+                        .slot {
+                            padding: 15px 5px;
+                            border-radius: 10px;
+                            text-align: center;
+                            border: 2px solid;
+                        }
+
+                        .slot.available {
+                            background: #e9f7ef;
+                            border-color: #198754;
+                            color: #198754;
+                        }
+
+                        .slot.occupied {
+                            background: #fdecec;
+                            border-color: #dc3545;
+                            color: #dc3545;
+                        }
+
+                        .slot .car {
+                            font-size: 25px;
+                        }
+
+                        .forms {
+                            display: grid;
+                            grid-template-columns:
+                                repeat(auto-fit, minmax(300px, 1fr));
+                            gap: 20px;
+                        }
+
+                        label {
+                            display: block;
+                            font-weight: bold;
+                            margin-top: 12px;
+                            margin-bottom: 5px;
+                        }
+
+                        input, select, button {
+                            width: 100%;
+                            padding: 11px;
+                            border-radius: 7px;
+                            border: 1px solid #ccc;
+                            font-size: 15px;
+                        }
+
+                        button {
+                            margin-top: 15px;
+                            background: #0d6efd;
+                            color: white;
+                            border: none;
+                            cursor: pointer;
+                        }
+
+                        button:hover {
+                            opacity: 0.9;
+                        }
+
+                        .exit-button {
+                            background: #198754;
+                        }
+
+                        table {
+                            width: 100%;
+                            border-collapse: collapse;
+                            margin-top: 10px;
+                        }
+
+                        th, td {
+                            border-bottom: 1px solid #ddd;
+                            padding: 10px;
+                            text-align: left;
+                        }
+
+                        th {
+                            background: #f8f9fa;
+                        }
+
+                        .table-wrapper {
+                            overflow-x: auto;
+                        }
+
+                        .fee-table td:last-child {
+                            text-align: right;
+                            font-weight: bold;
+                        }
+
+                        .message {
+                            padding: 13px;
+                            background: #e9f7ef;
+                            color: #146c43;
+                            border: 1px solid #badbcc;
+                            border-radius: 8px;
+                            margin-bottom: 20px;
+                        }
+
+                        footer {
+                            text-align: center;
+                            padding: 30px;
+                            color: #777;
+                        }
+                    </style>
+                </head>
+
+                <body>
+
+                <header>
+                    <h1>🚗 ParkSmart Kenya</h1>
+                    <p>Automated Parking Management System</p>
+                </header>
+
+                <div class="container">
+                """);
+
+        html.append("""
+                <div class="stats">
+                    <div class="stat">
+                        <div>Total Slots</div>
+                        <h2 class="blue">
+                """).append(total).append("""
+                        </h2>
+                    </div>
+
+                    <div class="stat">
+                        <div>Available</div>
+                        <h2 class="green">
+                """).append(available).append("""
+                        </h2>
+                    </div>
+
+                    <div class="stat">
+                        <div>Occupied</div>
+                        <h2 class="red">
+                """).append(occupied).append("""
+                        </h2>
+                    </div>
+                </div>
+                """);
+
+        // Parking slot display
+        html.append("""
+                <div class="card">
+                    <h2>Parking Slots</h2>
+                    <p>
+                        <span class="green">● Available</span>
+                        &nbsp;&nbsp;
+                        <span class="red">● Occupied</span>
+                    </p>
+
+                    <div class="grid">
+                """);
+
+        for (ParkingSlot slot : slots) {
+            String css = slot.occupied ? "occupied" : "available";
+            String status = slot.occupied ? "OCCUPIED" : "AVAILABLE";
+
+            html.append("""
+                    <div class="slot %s">
+                        <div class="car">🚗</div>
+                        <strong>%s</strong><br>
+                        <small>%s</small>
+                    </div>
+                    """.formatted(css, escapeHtml(slot.number), status));
+        }
+
+        html.append("""
+                    </div>
+                </div>
+                """);
+
+        // Entry and fee section
+        html.append("""
+                <div class="forms">
+
+                    <div class="card">
+                        <h2>Vehicle Entry</h2>
+
+                        <form method="POST" action="/entry">
+
+                            <label>Vehicle Registration</label>
+                            <input type="text"
+                                   name="plate"
+                                   placeholder="e.g. KDA 123A"
+                                   required>
+
+                            <label>Vehicle Type</label>
+                            <select name="vehicleType">
+                                <option>Car</option>
+                                <option>Motorcycle</option>
+                                <option>Van</option>
+                                <option>Truck</option>
+                            </select>
+
+                            <label>Available Parking Slot</label>
+                            <select name="slot" required>
+                                <option value="">
+                                    -- Select Slot --
+                                </option>
+                """);
+
+        for (ParkingSlot slot : slots) {
+            if (!slot.occupied) {
+                html.append("""
+                        <option value="%s">%s</option>
+                        """.formatted(
+                        escapeHtml(slot.number),
+                        escapeHtml(slot.number)
+                ));
+            }
+        }
+
+        html.append("""
+                            </select>
+
+                            <button type="submit">
+                                Record Arrival & Open Entry Barrier
+                            </button>
+                        </form>
+                    </div>
+
+                    <div class="card">
+                        <h2>Parking Fee Structure</h2>
+
+                        <table class="fee-table">
+                            <tr>
+                                <td>Up to 30 minutes</td>
+                                <td>FREE</td>
+                            </tr>
+                            <tr>
+                                <td>Up to 2 hours</td>
+                                <td>KSh 50</td>
+                            </tr>
+                            <tr>
+                                <td>Up to 4 hours</td>
+                                <td>KSh 100</td>
+                            </tr>
+                            <tr>
+                                <td>Up to 6 hours</td>
+                                <td>KSh 300</td>
+                            </tr>
+                            <tr>
+                                <td>Over 6 hours</td>
+                                <td>KSh 500</td>
+                            </tr>
+                        </table>
+
+                        <p>
+                            <strong>Note:</strong>
+                            Payment and barrier opening are simulated
+                            for this academic prototype.
+                        </p>
+                    </div>
+
+                </div>
+                """);
+
+        // Active vehicles
+        html.append("""
+                <div class="card">
+                    <h2>Vehicles Currently Inside</h2>
+                """);
+
+        boolean hasActive = false;
+
+        synchronized (records) {
+            for (ParkingRecord record : records) {
+                if (record.exitTime == null) {
+                    hasActive = true;
+
+                    html.append("""
+                        <div style="
+                            border:1px solid #ddd;
+                            padding:15px;
+                            border-radius:8px;
+                            margin-bottom:10px;">
+
+                            <strong>Registration:</strong> %s<br>
+                            <strong>Vehicle:</strong> %s<br>
+                            <strong>Slot:</strong> %s<br>
+                            <strong>Entry:</strong> %s
+
+                            <form method="POST"
+                                  action="/exit"
+                                  style="margin-top:10px;">
+
+                                <input type="hidden"
+                                       name="id"
+                                       value="%d">
+
+                                <button class="exit-button"
+                                        type="submit">
+                                    Calculate Fee, Receive Payment
+                                    & Open Exit Barrier
+                                </button>
+                            </form>
+                        </div>
+                        """.formatted(
+                            escapeHtml(record.plateNumber),
+                            escapeHtml(record.vehicleType),
+                            escapeHtml(record.slotNumber),
+                            escapeHtml(record.entryTime.format(DATE_TIME)),
+                            record.id
+                    ));
+                }
+            }
+        }
+
+        if (!hasActive) {
+            html.append("""
+                    <p>No vehicles are currently parked.</p>
+                    """);
+        }
+
+        html.append("</div>");
+
+        // History
+        html.append("""
+                <div class="card">
+                    <h2>Recent Parking History</h2>
+
+                    <div class="table-wrapper">
+                    <table>
+                        <tr>
+                            <th>Registration</th>
+                            <th>Slot</th>
+                            <th>Entry</th>
+                            <th>Exit</th>
+                            <th>Duration</th>
+                            <th>Amount</th>
+                            <th>Payment</th>
+                            <th>Barrier</th>
+                        </tr>
+                """);
+
+        List<ParkingRecord> completed = new ArrayList<>();
+
+        synchronized (records) {
+            for (ParkingRecord record : records) {
+                if (record.exitTime != null) {
+                    completed.add(record);
+                }
+            }
+        }
+
+        completed.sort((a, b) ->
+                b.exitTime.compareTo(a.exitTime)
+        );
+
+        int historyCount = Math.min(20, completed.size());
+
+        for (int i = 0; i < historyCount; i++) {
+            ParkingRecord r = completed.get(i);
+
+            html.append("""
+                    <tr>
+                        <td>%s</td>
+                        <td>%s</td>
+                        <td>%s</td>
+                        <td>%s</td>
+                        <td>%d minutes</td>
+                        <td>KSh %.0f</td>
+                        <td>%s</td>
+                        <td>%s</td>
+                    </tr>
+                    """.formatted(
+                    escapeHtml(r.plateNumber),
+                    escapeHtml(r.slotNumber),
+                    escapeHtml(r.entryTime.format(DATE_TIME)),
+                    escapeHtml(r.exitTime.format(DATE_TIME)),
+                    r.durationMinutes,
+                    r.amount,
+                    escapeHtml(r.paymentStatus),
+                    escapeHtml(r.barrierStatus)
+            ));
+        }
+
+        html.append("""
+                    </table>
+                    </div>
+                </div>
+
+                </div>
+
+                <footer>
+                    ParkSmart Kenya &copy; 2026
+                    <br>
+                    MMU Java System Development Project
+                </footer>
+
+                </body>
+                </html>
+                """);
+
+        return html.toString();
+    }
+
+    // ------------------------------------------------------------
+    // VEHICLE ENTRY
+    // ------------------------------------------------------------
+
+    private static void handleEntry(HttpExchange exchange)
+            throws IOException {
+
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            redirect(exchange, "/");
+            return;
+        }
+
+        Map<String, String> form =
+                parseFormData(exchange);
+
+        String plate = clean(form.get("plate"));
+        String vehicleType = clean(form.get("vehicleType"));
+        String slotNumber = clean(form.get("slot"));
+
+        if (plate.isEmpty() || slotNumber.isEmpty()) {
+            redirect(exchange, "/");
+            return;
+        }
+
+        synchronized (records) {
+
+            // Check whether vehicle is already inside.
+            for (ParkingRecord r : records) {
+                if (r.exitTime == null &&
+                        r.plateNumber.equalsIgnoreCase(plate)) {
+
+                    redirect(exchange, "/");
+                    return;
+                }
+            }
+
+            ParkingSlot selected = findSlot(slotNumber);
+
+            if (selected == null || selected.occupied) {
+                redirect(exchange, "/");
+                return;
+            }
+
+            selected.occupied = true;
+
+            ParkingRecord record = new ParkingRecord(
+                    nextRecordId++,
+                    plate,
+                    vehicleType,
+                    selected.number,
+                    LocalDateTime.now()
+            );
+
+            records.add(record);
+        }
+
+        saveData();
+        redirect(exchange, "/");
+    }
+
+    // ------------------------------------------------------------
+    // VEHICLE EXIT
+    // ------------------------------------------------------------
+
+    private static void handleExit(HttpExchange exchange)
+            throws IOException {
+
+        if (!exchange.getRequestMethod().equalsIgnoreCase("POST")) {
+            redirect(exchange, "/");
+            return;
+        }
+
+        Map<String, String> form =
+                parseFormData(exchange);
+
+        String idString = form.get("id");
+
+        if (idString == null) {
+            redirect(exchange, "/");
+            return;
+        }
+
+        try {
+            int id = Integer.parseInt(idString);
+
+            synchronized (records) {
+                for (ParkingRecord record : records) {
+
+                    if (record.id == id &&
+                            record.exitTime == null) {
+
+                        LocalDateTime exit = LocalDateTime.now();
+
+                        long minutes = Duration.between(
+                                record.entryTime,
+                                exit
+                        ).toMinutes();
+
+                        record.exitTime = exit;
+                        record.durationMinutes = (int) Math.max(
+                                0, minutes
+                        );
+
+                        record.amount =
+                                calculateFee(record.durationMinutes);
+
+                        // Simulated payment
+                        record.paymentStatus = "PAID";
+
+                        // Simulated barrier
+                        record.barrierStatus = "OPEN";
+
+                        ParkingSlot slot =
+                                findSlot(record.slotNumber);
+
+                        if (slot != null) {
+                            slot.occupied = false;
+                        }
+
+                        break;
+                    }
+                }
+            }
+
+            saveData();
+
+        } catch (NumberFormatException ignored) {
+        }
+
+        redirect(exchange, "/");
+    }
+
+    // ------------------------------------------------------------
+    // FEE ALGORITHM
+    // ------------------------------------------------------------
+
+    /**
+     * Parking fee algorithm from the assignment:
+     *
+     * Up to 30 minutes = Free
+     * Up to 2 hours = KSh 50
+     * Up to 4 hours = KSh 100
+     * Up to 6 hours = KSh 300
+     * Over 6 hours = KSh 500
+     */
+    private static double calculateFee(int minutes) {
+
+        if (minutes <= 30) {
+            return 0;
+        }
+
+        if (minutes <= 120) {
+            return 50;
+        }
+
+        if (minutes <= 240) {
+            return 100;
+        }
+
+        if (minutes <= 360) {
+            return 300;
+        }
+
+        return 500;
+    }
+
+    // ------------------------------------------------------------
+    // SLOT API
+    // ------------------------------------------------------------
+
+    private static void handleSlotsApi(HttpExchange exchange)
+            throws IOException {
+
+        if (!exchange.getRequestMethod().equalsIgnoreCase("GET")) {
+            sendResponse(
+                    exchange,
+                    405,
+                    "{\"error\":\"Method not allowed\"}",
+                    "application/json"
+            );
+            return;
+        }
+
+        StringBuilder json = new StringBuilder("[");
+        boolean first = true;
+
+        for (ParkingSlot slot : slots) {
+
+            if (!first) {
+                json.append(",");
+            }
+
+            first = false;
+
+            json.append("{")
+                    .append("\"slot\":\"")
+                    .append(jsonEscape(slot.number))
+                    .append("\",")
+                    .append("\"status\":\"")
+                    .append(slot.occupied
+                            ? "OCCUPIED"
+                            : "AVAILABLE")
+                    .append("\"")
+                    .append("}");
+        }
+
+        json.append("]");
+
+        sendResponse(
+                exchange,
+                200,
+                json.toString(),
+                "application/json"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // FEE API
+    // ------------------------------------------------------------
+
+    private static void handleFeeApi(HttpExchange exchange)
+            throws IOException {
+
+        String query = exchange.getRequestURI()
+                .getRawQuery();
+
+        Map<String, String> params =
+                parseQuery(query);
+
+        try {
+
+            int minutes = Integer.parseInt(
+                    params.getOrDefault("minutes", "0")
+            );
+
+            double fee = calculateFee(minutes);
+
+            String json = """
+                    {
+                      "minutes": %d,
+                      "amount": %.0f
+                    }
+                    """.formatted(minutes, fee);
+
+            sendResponse(
+                    exchange,
+                    200,
+                    json,
+                    "application/json"
+            );
+
+        } catch (NumberFormatException e) {
+
+            sendResponse(
+                    exchange,
+                    400,
+                    "{\"error\":\"minutes must be a number\"}",
+                    "application/json"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------
+    // UTILITIES
+    // ------------------------------------------------------------
+
+    private static ParkingSlot findSlot(String number) {
+        for (ParkingSlot slot : slots) {
+            if (slot.number.equalsIgnoreCase(number)) {
+                return slot;
+            }
+        }
+
+        return null;
+    }
+
+    private static Map<String, String> parseFormData(
+            HttpExchange exchange) throws IOException {
+
+        InputStream input = exchange.getRequestBody();
+
+        String body = new String(
+                input.readAllBytes(),
+                StandardCharsets.UTF_8
+        );
+
+        return parseQuery(body);
+    }
+
+    private static Map<String, String> parseQuery(String query) {
+
+        Map<String, String> result =
+                new HashMap<>();
+
+        if (query == null || query.isEmpty()) {
+            return result;
+        }
+
+        String[] pairs = query.split("&");
+
+        for (String pair : pairs) {
+
+            String[] parts = pair.split("=", 2);
+
+            String key = urlDecode(parts[0]);
+
+            String value = parts.length > 1
+                    ? urlDecode(parts[1])
+                    : "";
+
+            result.put(key, value);
+        }
+
+        return result;
+    }
+
+    private static String urlDecode(String value) {
+        try {
+            return URLDecoder.decode(
+                    value,
+                    StandardCharsets.UTF_8
+            );
+        } catch (Exception e) {
+            return value;
+        }
+    }
+
+    private static String clean(String value) {
+        if (value == null) {
+            return "";
+        }
+
+        return value.trim().toUpperCase();
+    }
+
+    private static String escapeHtml(String value) {
+
+        if (value == null) {
+            return "";
+        }
+
+        return value
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&#39;");
+    }
+
+    private static String jsonEscape(String value) {
+
+        if (value == null) {
+            return "";
+        }
+
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"");
+    }
+
+    private static void redirect(
+            HttpExchange exchange,
+            String location) throws IOException {
+
+        Headers headers = exchange.getResponseHeaders();
+
+        headers.add("Location", location);
+
+        exchange.sendResponseHeaders(303, -1);
+
+        exchange.close();
+    }
+
+    private static void sendResponse(
+            HttpExchange exchange,
+            int status,
+            String body,
+            String contentType) throws IOException {
+
+        byte[] bytes =
+                body.getBytes(StandardCharsets.UTF_8);
+
+        Headers headers =
+                exchange.getResponseHeaders();
+
+        headers.set(
+                "Content-Type",
+                contentType + "; charset=UTF-8"
+        );
+
+        exchange.sendResponseHeaders(
+                status,
+                bytes.length
+        );
+
+        try (OutputStream output =
+                     exchange.getResponseBody()) {
+
+            output.write(bytes);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // DATA CLASSES
+    // ------------------------------------------------------------
+
+    private static class ParkingSlot
+            implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        String number;
+        boolean occupied;
+
+        ParkingSlot(String number) {
+            this.number = number;
+            this.occupied = false;
+        }
+    }
+
+    private static class ParkingRecord
+            implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        int id;
+        String plateNumber;
+        String vehicleType;
+        String slotNumber;
+        LocalDateTime entryTime;
+        LocalDateTime exitTime;
+
+        int durationMinutes;
+        double amount;
+
+        String paymentStatus;
+        String barrierStatus;
+
+        ParkingRecord(
+                int id,
+                String plateNumber,
+                String vehicleType,
+                String slotNumber,
+                LocalDateTime entryTime) {
+
+            this.id = id;
+            this.plateNumber = plateNumber;
+            this.vehicleType = vehicleType;
+            this.slotNumber = slotNumber;
+            this.entryTime = entryTime;
+
+            this.durationMinutes = 0;
+            this.amount = 0;
+
+            this.paymentStatus = "UNPAID";
+            this.barrierStatus = "CLOSED";
+        }
+    }
+
+    private static class ParkingDatabase
+            implements Serializable {
+
+        private static final long serialVersionUID = 1L;
+
+        List<ParkingSlot> slots;
+        List<ParkingRecord> records;
+        int nextRecordId;
+
+        ParkingDatabase(
+                List<ParkingSlot> slots,
+                List<ParkingRecord> records,
+                int nextRecordId) {
+
+            this.slots = new ArrayList<>(slots);
+            this.records = new ArrayList<>(records);
+            this.nextRecordId = nextRecordId;
+        }
+    }
+}
